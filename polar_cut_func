@@ -1,3 +1,5 @@
+match = re.match(r'[\[\(]\s*([-\d\.]+)\s*,\s*([-\d\.]+)\s*[\]\)]', iv)
+
 import polars as pl
 from typing import Sequence, Optional, Union
 
