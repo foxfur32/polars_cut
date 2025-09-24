@@ -1,0 +1,108 @@
+import polars as pl
+from typing import Sequence, Optional, Union
+
+def cut_polars(
+    col: Union[str, pl.Expr],
+    bins: Sequence[float],
+    labels: Optional[Sequence[str]] = None,
+    *,
+    right: bool = True,
+    include_lowest: bool = False,
+    categorical: bool = True,
+    label_precision: int = 3,
+) -> pl.Expr:
+    """
+    Discretize a continuous column into bins (pd.cut-like), returning a Polars expression.
+
+    Parameters
+    ----------
+    col : str | pl.Expr
+        Column name or Polars expression to cut.
+    bins : sequence of float
+        Monotonically increasing bin edges. Number of bins == len(bins) - 1.
+    labels : sequence of str | None, default None
+        If provided, must have length len(bins) - 1. If None, interval strings are used.
+    right : bool, default True
+        If True, bins are right-closed (a, b]; if False, left-closed [a, b).
+    include_lowest : bool, default False
+        When right=True, makes the first bin left-inclusive [a, b] instead of (a, b].
+        (Matches pandas' include_lowest behavior.)
+    categorical : bool, default True
+        If True, cast the result to pl.Categorical; else leave as pl.Utf8.
+    label_precision : int, default 3
+        Significant digits for auto-generated interval labels.
+
+    Returns
+    -------
+    pl.Expr
+        Expression yielding a categorical (or utf8) column with bin labels. Rows outside
+        the bin range become null.
+    """
+    # Normalize input to Expr
+    expr = pl.col(col) if isinstance(col, str) else col
+
+    # Basic validation
+    if len(bins) < 2:
+        raise ValueError("`bins` must have at least two edges.")
+    if any(bins[i] >= bins[i+1] for i in range(len(bins)-1)):
+        raise ValueError("`bins` must be strictly increasing.")
+    n_bins = len(bins) - 1
+
+    if labels is not None and len(labels) != n_bins:
+        raise ValueError("`labels` length must equal len(bins) - 1.")
+
+    # Auto labels if needed
+    def _fmt(x: float) -> str:
+        # readable formatting similar to pandas
+        return f"{x:.{label_precision}g}"
+
+    if labels is None:
+        default_labels = []
+        for i in range(n_bins):
+            lo, hi = bins[i], bins[i+1]
+            if right:
+                # (lo, hi] except possibly the first bin if include_lowest -> [lo, hi]
+                left_br = "[" if (i == 0 and include_lowest) else "("
+                default_labels.append(f"{left_br}{_fmt(lo)}, {_fmt(hi)}]")
+            else:
+                # [lo, hi)
+                default_labels.append(f"[{_fmt(lo)}, {_fmt(hi)})")
+        labels = default_labels
+
+    # Build a bin-index expression via chained conditions
+    # For values outside all bins -> null
+    cond_then_pairs = []
+    for i in range(n_bins):
+        lo, hi = bins[i], bins[i+1]
+        if right:
+            # (lo, hi] OR [lo, hi] for the first bin if include_lowest
+            if i == 0 and include_lowest:
+                cond = (expr >= lo) & (expr <= hi)
+            else:
+                cond = (expr > lo) & (expr <= hi)
+        else:
+            # [lo, hi)
+            cond = (expr >= lo) & (expr < hi)
+        cond_then_pairs.append((cond, pl.lit(i)))
+
+    # Start chaining .when/.then and end with otherwise(None)
+    when_expr = pl.when(cond_then_pairs[0][0]).then(cond_then_pairs[0][1])
+    for cond, val in cond_then_pairs[1:]:
+        when_expr = when_expr.when(cond).then(val)
+    bin_idx = when_expr.otherwise(pl.lit(None, dtype=pl.Int32)).alias("__bin_idx__")
+
+    # Map bin index -> label using a literal list and arr.get
+    label_series_lit = pl.lit(list(labels))
+    labeled = label_series_lit.arr.get(pl.col("__bin_idx__")).alias("__binned__")
+
+    # Cast to categorical if requested and return as a single expression
+    out = pl.when(pl.col("__bin_idx__").is_null()).then(None).otherwise(labeled)
+    out = out.cast(pl.Categorical) if categorical else out.cast(pl.Utf8)
+    return out
+
+# -------------------------
+# Example usage:
+# df = pl.DataFrame({"x": [1, 5, 7, 12, 20, 25, 33, 40, None, -1, 100]})
+# binned_expr = cut_polars("x", bins=[0, 10, 20, 30, 40], right=True, include_lowest=True)
+# df = df.with_columns(binned_expr.alias("x_binned"))
+# print(df)
